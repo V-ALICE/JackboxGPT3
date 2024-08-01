@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using JackboxGPT3.Extensions;
@@ -15,16 +16,17 @@ namespace JackboxGPT3.Engines
     {
         protected override string Tag => "fourbage";
 
-        private string _previousQuestion; // Fibbage 4 doesn't send the original prompt when it sends choices
+        // Fibbage 4 doesn't send the original prompt when it sends lie choices, so this keeps track of it
+        private string _previousQuestion; 
 
         public Fibbage4Engine(ICompletionService completionService, ILogger logger, Fibbage4Client client, int instance)
             : base(completionService, logger, client, instance)
         {
-            JackboxClient.OnRoomUpdate += OnRoomUpdate;
+            JackboxClient.OnSelfUpdate += OnSelfUpdate;
             JackboxClient.Connect();
         }
 
-        private void OnRoomUpdate(object sender, Revision<Fibbage4Room> revision)
+        private void OnSelfUpdate(object sender, Revision<Fibbage4Player> revision)
         {
             var self = revision.New;
             if (revision.Old.State != revision.New.State)
@@ -36,7 +38,7 @@ namespace JackboxGPT3.Engines
             {
                 if (self.Error != null)
                 {
-                    LogWarning($"Received submission error from game: {self.Error}");
+                    LogWarning($"Received submission error from game: \"{self.Error}\"");
                     if (self.Error.Contains("Too close to the truth"))
                         FailureCounter += 1;
                 }
@@ -75,110 +77,73 @@ namespace JackboxGPT3.Engines
         }
 
         #region Game Actions
-        private async void SubmitLie(Fibbage4Room self)
+        private async void SubmitLie(Fibbage4Player self)
         {
-            LieLock = true;
             _previousQuestion = self.Question;
 
-            if (FailureCounter > MaxFailures)
-            {
-                LogInfo("Submitting default answer because there were too many submission errors.");
-                JackboxClient.SubmitLie("NO ANSWER"); // TODO: use suggestion
-                FailureCounter = 0;
-                return;
-            }
-
-            var prompt = CleanPromptForEntry(self.Question);
-            LogInfo($"Asking GPT-3 for lie in response to \"{prompt}\".", true);
-
-            var lie = await ProvideLie(prompt, self.MaxLength);
-            LogInfo($"Submitting lie \"{lie}\"");
-
+            var lie = await FormLie(self.Question, self.MaxLength);
             JackboxClient.SubmitLie(lie);
         }
         
-        private async void SubmitDoubleLie(Fibbage4Room self)
+        private async void SubmitDoubleLie(Fibbage4Player self)
         {
-            LieLock = true;
             _previousQuestion = self.Question;
 
-            if (FailureCounter > MaxFailures)
-            {
-                LogInfo("Submitting default answer because there were too many submission errors.");
-                JackboxClient.SubmitDoubleLie("NO", "ANSWER");
-                FailureCounter = 0;
-                return;
-            }
-
-            var prompt = CleanPromptForEntry(self.Question);
-            LogInfo($"Asking GPT-3 for double lie in response to \"{prompt}\".", true);
-
-            var lie = await ProvideDoubleLie(prompt, self.JoiningPhrase, self.MaxLength);
-            LogInfo($"Submitting double lie \"{lie.Item1}{self.JoiningPhrase}{lie.Item2}\"");
-
+            var lie = await FormDoubleLie(self.Question, self.JoiningPhrase, self.MaxLength);
             JackboxClient.SubmitDoubleLie(lie.Item1, lie.Item2);
         }
 
-        private async void SubmitMutualLie(Fibbage4Room self)
+        private async void SubmitMutualLie(Fibbage4Player self)
         {
             LieLock = true;
             _previousQuestion = self.Question;
 
-            if (FailureCounter > MaxFailures)
-            {
-                LogInfo("Submitting default answer because there were too many submission errors.");
-                JackboxClient.SubmitLie("NO ANSWER");
-                FailureCounter = 0;
-                return;
-            }
-
-            var prompt1 = CleanPromptForEntry(self.Question);
-            var prompt2 = CleanPromptForEntry(self.Question2 ?? throw new InvalidOperationException());
-            LogInfo($"Asking GPT-3 for lie in response to \"{prompt1}\" and \"{prompt2}\".", true);
-
-            // GPT3 doesn't really have the wherewithal to get the context of this type of question
-            // So the questions are given in a random order in order to give AI players more variety
-            // when there are multiple in the same game
             string lie;
-            if (new Random().Next(2) == 0)
-                lie = await ProvideMutualLie(prompt1, prompt2, self.MaxLength);
+            if (FailureCounter > MAX_ERRORS)
+            {
+                FailureCounter = 0;
+                LogInfo("Submitting a default answer because there were too many submission errors.");
+
+                lie = GetDefaultLie();
+            }
             else
-                lie = await ProvideMutualLie(prompt1, prompt2, self.MaxLength);
+            {
+                var prompt1 = CleanPromptForEntry(self.Question);
+                var prompt2 = CleanPromptForEntry(self.Question2);
+                LogInfo($"Asking GPT-3 for lie in response to \"{prompt1}\" and \"{prompt2}\"", true, prefix: "\n\n\n");
+
+                // GPT3 doesn't really have the wherewithal to get the context of this type of question,
+                // so the questions are given in a random order in order to give AI players more variety
+                if (new Random().Next(2) == 0)
+                    lie = await ProvideMutualLie(prompt1, prompt2, self.MaxLength);
+                else
+                    lie = await ProvideMutualLie(prompt1, prompt2, self.MaxLength);
+            }
 
             LogInfo($"Submitting lie \"{lie}\"");
             JackboxClient.SubmitLie(lie);
         }
 
-        private async void SubmitTruth(Fibbage4Room self)
+        private async void SubmitTruth(Fibbage4Player self)
         {
-            TruthLock = true;
-
-            var prompt = "";
+            int truth = 0;
             switch (self.Context)
             {
                 case RoomContext.PickTruth:
-                    prompt = CleanPromptForEntry(_previousQuestion);
+                    truth = await FormTruth(_previousQuestion, self.LieChoices);
                     break;
                 case RoomContext.FinalRound1:
-                    prompt = CleanPromptForEntry(self.Prompt);
-                    break;
                 case RoomContext.FinalRound2:
-                    prompt = CleanPromptForEntry(self.Prompt);
+                    truth = await FormTruth(self.Prompt, self.LieChoices);
                     break;
             }
-
-            var choices = self.LieChoices;
-            var choicesStr = choices.Aggregate("", (current, a) => current + (a.Text + ", "))[..^2];
-            LogInfo($"Asking GPT-3 to choose truth out of these options [{choicesStr}].", true);
-            var truth = await ProvideTruth(prompt, choices);
-            LogInfo($"Submitting truth {truth} (\"{choices[truth].Text}\")");
-
+            
             JackboxClient.ChooseTruth(truth);
         }
 
-        private async void ChooseRandomCategory(Fibbage4Room self)
+        private async void ChooseRandomCategory(Fibbage4Player self)
         {
-            LogInfo("Time to choose a category.", prefix: "\n\n");
+            LogInfo("Time to choose a category.", prefix: "\n");
             await Task.Delay(3000);
 
             var choices = self.CategoryChoices;
@@ -222,7 +187,10 @@ A:";
                     LogDebug($"Received unusable ProvideLie response: {completion.Text.Trim()}");
                     return false;
                 },
-                defaultResponse: "Default Response");
+                defaultResponse: "");
+
+            if (result.Text.Length == 0)
+                return GetDefaultLie();
 
             var cleanText = CleanResult(result.Text.Trim(), fibPrompt1);
             return CleanResult(cleanText, fibPrompt2);
@@ -230,9 +198,22 @@ A:";
         #endregion
 
         #region Prompt Cleanup
-        private static string CleanPromptForEntry(string prompt)
+        protected override string CleanPromptForEntry(string prompt)
         {
             return prompt.Replace("[blank][/blank]", "_______").StripTags();
+        }
+
+        protected override string GetDefaultLie()
+        {
+            var choices = JackboxClient.GameState.Self.SuggestionChoices;
+            return choices[choices.RandomIndex()];
+        }
+
+        protected override Tuple<string, string> GetDefaultDoubleLie()
+        {
+            var choices = JackboxClient.GameState.Self.SuggestionChoices;
+            var parts = choices[choices.RandomIndex()].Split('|');
+            return new Tuple<string, string>(parts[0], parts[1]);
         }
         #endregion
     }
